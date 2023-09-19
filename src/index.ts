@@ -1,56 +1,82 @@
 import express from 'express';
+import sql from 'mssql';
 import axios from 'axios';
-import nodemailer from 'nodemailer';
-import * as BP from 'body-parser';
 import dotenv from 'dotenv';
+import * as BP from 'body-parser';
 
 const app = express();
 const port = process.env.PORT || '6543';
 
 dotenv.config();
-app.use(BP.json());
+app.use(BP.json({ limit: '5mb' }));
 
-// Define your SMTP transport configuration
-const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: process.env.USER,
-        pass: process.env.PASSWORD
+const sqlConfig = {
+    user: process.env.SQL_USER,
+    password: process.env.SQL_PASSWORD,
+    server: process.env.SQL_SERVER,
+    database: process.env.SQL_DATABASE,
+    options: {
+        trustServerCertificate: true,
+    },
+};
+
+let sqlPool: any; // Declare a variable to hold the connection pool
+
+async function initSqlPool() {
+    if (!sqlPool) {
+        sqlPool = await sql.connect(sqlConfig);
     }
-})
+}
+
+async function fetchImageAndCreateBuffer(link: string) {
+    try {
+        const response = await axios.get(link, {
+            responseType: 'arraybuffer',
+        });
+        const imageBuffer = Buffer.from(response.data, 'binary');
+        return imageBuffer;
+    } catch (err) {
+        console.error({ err });
+    }
+}
 
 app.get('/send-email', async (req, res) => {
     try {
-        const { emails, subject, text, imageLink } = req.body as any;
-        if (!emails || !text || !subject) {
-            return res.status(400).send('Recipents, subject and text are required.');
+        await initSqlPool();
+        const { userKey, userID, email, from, subject, message, richmessage, account, cc, bcc, attachement } = req.body;
+        //Stored procedure for EmailQueue
+        const emailQueue = `exec QueueEmail @uk,@uid,@address,@from,@subject,@message,@richmessage,@account,@cc,@bcc`;
+
+        const request = new sql.Request(sqlPool);
+        request.input('uk', userKey);
+        request.input('uid', userID);
+        request.input('from', from);
+        request.input('subject', subject);
+        request.input('message', message);
+        request.input('richmessage', richmessage);
+        request.input('account', account);
+        request.input('cc', cc);
+        request.input('bcc', bcc);
+        request.input('address', email);
+
+        const { recordset: [{ Key: mkey }] } = await request.query(emailQueue);
+
+        if (attachement) {
+            //Stored procedure for EmailAttachments
+            const attachementProcedure = `exec AddEmailAttachment @mkey,@name,@data`;
+            const attachmentRequest = new sql.Request(sqlPool);
+
+            attachmentRequest.input('mkey', mkey);
+            attachmentRequest.input('name', attachement.name);
+            attachmentRequest.input('data', await fetchImageAndCreateBuffer(attachement.data));
+
+            await attachmentRequest.query(attachementProcedure);
         }
 
-        let config: any = {
-            to: emails, //Array of user emails
-            subject: subject,
-            text: text,
-        }
-
-        if (!!imageLink) {
-            const response = await axios.get(imageLink, { responseType: 'arraybuffer' });
-            const imageBuffer = Buffer.from(response.data, 'binary');
-
-            config.attachments = [
-                {
-                    filename: `image.jpg`,
-                    content: imageBuffer,
-                },
-            ]
-        }
-
-        // Send email
-        await transporter.sendMail(config);
-
-        res.send('Email sent successfully.');
+        res.status(200).send({ msg: "Data inserted in queue successfully!!" });
     } catch (error) {
-        console.error('Error sending email:');
-        res.status(500).send('An error occurred while sending the email.');
+        console.error('Error sending email:', error);
+        res.status(500).send({ error });
     }
 });
 
